@@ -84,6 +84,11 @@ public class Main {
                     System.out.println(parser.getRawXhtml(file));
                     break;
 
+                case "saxdebug":
+                    System.out.println("=== SAX Events (body only) ===");
+                    parser.debugSaxParse(file);
+                    break;
+
                 case "text":
                     System.out.println("=== Plain Text ===");
                     System.out.println(parser.getPlainText(file));

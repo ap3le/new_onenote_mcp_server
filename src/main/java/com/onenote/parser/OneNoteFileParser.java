@@ -11,6 +11,8 @@ import org.apache.tika.sax.BodyContentHandler;
 import org.apache.tika.sax.RecursiveParserWrapperHandler;
 import org.apache.tika.sax.ToXMLContentHandler;
 
+import org.apache.tika.parser.microsoft.onenote.OneNoteTitleExtractor;
+
 import javax.xml.parsers.SAXParser;
 import javax.xml.parsers.SAXParserFactory;
 import java.io.BufferedInputStream;
@@ -116,6 +118,21 @@ public class OneNoteFileParser {
         return metadata;
     }
 
+    /**
+     * Debug: parse with SAX event logging to see ALL structural elements Tika emits.
+     */
+    public void debugSaxParse(File file) throws Exception {
+        AutoDetectParser parser = new AutoDetectParser();
+        DebugSaxHandler debugHandler = new DebugSaxHandler();
+        Metadata metadata = new Metadata();
+        metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, file.getName());
+        ParseContext context = new ParseContext();
+
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(file.toPath()))) {
+            parser.parse(is, debugHandler, metadata, context);
+        }
+    }
+
     // ----------------------------------------------------------------
     // Strategy 1: RecursiveParserWrapper
     // ----------------------------------------------------------------
@@ -174,11 +191,19 @@ public class OneNoteFileParser {
     // ----------------------------------------------------------------
 
     private List<OneNotePage> parseFromXhtml(File file) throws Exception {
+        // Extract page titles from binary format (more reliable than XHTML heuristics)
+        List<String> binaryTitles = null;
+        try {
+            binaryTitles = OneNoteTitleExtractor.extractTitles(file);
+        } catch (Exception e) {
+            // Binary title extraction failed; fall back to XHTML heuristics
+        }
+
         String xhtml = getRawXhtml(file);
-        return extractPagesFromXhtml(xhtml);
+        return extractPagesFromXhtml(xhtml, binaryTitles);
     }
 
-    private List<OneNotePage> extractPagesFromXhtml(String xhtml) throws Exception {
+    private List<OneNotePage> extractPagesFromXhtml(String xhtml, List<String> binaryTitles) throws Exception {
         // Step 1: Collect all paragraphs from the XHTML
         OneNoteParagraphCollector collector = new OneNoteParagraphCollector();
 
@@ -201,7 +226,7 @@ public class OneNoteFileParser {
         List<String> allParagraphs = collector.getParagraphs();
 
         // Step 2: Deduplicate revision data — Tika outputs all revisions, we want only the latest
-        List<List<String>> pageBlocks = OneNoteRevisionDeduplicator.deduplicate(allParagraphs);
+        List<List<String>> pageBlocks = OneNoteRevisionDeduplicator.deduplicate(allParagraphs, binaryTitles);
 
         // Step 3: Convert each page block to a OneNotePage (first paragraph = title, rest = content)
         List<OneNotePage> pages = new ArrayList<>();

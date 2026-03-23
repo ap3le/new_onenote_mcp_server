@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Deduplicates OneNote revision data from Tika's output.
@@ -30,6 +31,10 @@ import java.util.Set;
 class OneNoteRevisionDeduplicator {
 
     static List<List<String>> deduplicate(List<String> paragraphs) {
+        return deduplicate(paragraphs, null);
+    }
+
+    static List<List<String>> deduplicate(List<String> paragraphs, List<String> binaryTitles) {
         if (paragraphs.isEmpty()) {
             return new ArrayList<>();
         }
@@ -37,8 +42,12 @@ class OneNoteRevisionDeduplicator {
         List<PageRevisions> pageGroups = splitIntoPages(paragraphs);
 
         List<List<String>> pages = new ArrayList<>();
-        for (PageRevisions pr : pageGroups) {
-            List<String> pageContent = extractPageContent(pr);
+        for (int i = 0; i < pageGroups.size(); i++) {
+            PageRevisions pr = pageGroups.get(i);
+            // Use binary-extracted title if available
+            String forcedTitle = (binaryTitles != null && i < binaryTitles.size())
+                ? binaryTitles.get(i) : null;
+            List<String> pageContent = extractPageContent(pr, forcedTitle);
             if (!pageContent.isEmpty()) {
                 pages.add(pageContent);
             }
@@ -60,48 +69,76 @@ class OneNoteRevisionDeduplicator {
 
     private static List<PageRevisions> splitIntoPages(List<String> paragraphs) {
         List<PageRevisions> result = new ArrayList<>();
-        int pos = 0;
 
-        while (pos < paragraphs.size() - 1) {
-            String date = paragraphs.get(pos);
-            String time = paragraphs.get(pos + 1);
-            Set<String> metadata = new HashSet<>(Arrays.asList(date, time));
+        // Find all time-marker positions (end of each revision block)
+        List<Integer> timePositions = new ArrayList<>();
+        for (int i = 0; i < paragraphs.size(); i++) {
+            if (isTimePattern(paragraphs.get(i))) {
+                timePositions.add(i);
+            }
+        }
 
-            List<Integer> endPositions = new ArrayList<>();
-            for (int i = pos + 1; i < paragraphs.size(); i++) {
-                if (paragraphs.get(i).equals(time)) {
-                    endPositions.add(i);
+        if (timePositions.isEmpty()) {
+            return result;
+        }
+
+        // Split into blocks ending at each time marker
+        List<List<String>> blocks = new ArrayList<>();
+        int blockStart = 0;
+        for (int timePos : timePositions) {
+            List<String> block = new ArrayList<>();
+            for (int j = blockStart; j <= timePos; j++) {
+                block.add(paragraphs.get(j));
+            }
+            blocks.add(block);
+            blockStart = timePos + 1;
+        }
+
+        // Group consecutive blocks that are cumulative revisions of each other
+        int i = 0;
+        while (i < blocks.size()) {
+            List<List<String>> pageBlocks = new ArrayList<>();
+            pageBlocks.add(blocks.get(i));
+
+            int j = i + 1;
+            while (j < blocks.size()) {
+                List<String> curr = blocks.get(j);
+                List<String> prev = blocks.get(j - 1);
+                if (isCumulativeRevision(curr, prev) || isCumulativeRevision(prev, curr)) {
+                    pageBlocks.add(curr);
+                    j++;
+                } else {
+                    break;
                 }
             }
 
-            List<List<String>> revisions = new ArrayList<>();
-            int blockStart = pos;
-
-            for (int endPos : endPositions) {
-                List<String> block = new ArrayList<>();
-                for (int j = blockStart; j <= endPos; j++) {
-                    block.add(paragraphs.get(j));
+            // Sort revisions by size (ascending) — smallest = oldest
+            pageBlocks.sort(new java.util.Comparator<List<String>>() {
+                public int compare(List<String> a, List<String> b) {
+                    return a.size() - b.size();
                 }
+            });
 
-                if (!revisions.isEmpty()) {
-                    List<String> prev = revisions.get(revisions.size() - 1);
-                    if (!isCumulativeRevision(block, prev)) {
-                        break;
-                    }
+            // Find date and time from the blocks
+            String date = null;
+            String time = null;
+            for (List<String> block : pageBlocks) {
+                for (String p : block) {
+                    if (date == null && isDatePattern(p)) date = p;
+                    if (time == null && isTimePattern(p)) time = p;
                 }
-
-                revisions.add(block);
-                blockStart = endPos + 1;
             }
 
             PageRevisions pr = new PageRevisions();
-            pr.metadata = metadata;
             pr.dateParagraph = date;
             pr.timeParagraph = time;
-            pr.revisions = revisions;
+            pr.metadata = new HashSet<>();
+            if (date != null) pr.metadata.add(date);
+            if (time != null) pr.metadata.add(time);
+            pr.revisions = pageBlocks;
             result.add(pr);
 
-            pos = blockStart;
+            i = j;
         }
 
         return result;
@@ -109,18 +146,35 @@ class OneNoteRevisionDeduplicator {
 
     // ---- Step 2: Extract title + ordered content ----
 
-    private static List<String> extractPageContent(PageRevisions pr) {
-        if (pr.revisions.size() <= 1) {
+    private static List<String> extractPageContent(PageRevisions pr, String forcedTitle) {
+        if (pr.revisions.isEmpty()) {
             return new ArrayList<>();
         }
 
-        String title = detectTitle(pr.revisions.get(1), pr.dateParagraph, pr.timeParagraph);
+        // Use binary-extracted title if provided, otherwise detect from revision data
+        String title = forcedTitle;
+        if (title == null || title.isEmpty()) {
+            for (List<String> rev : pr.revisions) {
+                title = detectTitle(rev, pr.dateParagraph, pr.timeParagraph);
+                if (title != null && !title.equals("Untitled")) break;
+            }
+            if (title == null) title = "Untitled";
+        }
+
+        if (pr.revisions.size() <= 1) {
+            // Single revision (compacted) — use XHTML order heuristic
+            return extractSingleRevisionContent(pr.revisions.get(0), pr.metadata, title);
+        }
 
         // Process revisions sequentially, building ordered content via diffs
         List<String> orderedContent = new ArrayList<>();
         List<String> prevFiltered = filterContent(pr.revisions.get(0), pr.metadata, title);
 
         for (int i = 1; i < pr.revisions.size(); i++) {
+            // Initialize orderedContent from prevFiltered if starting with non-empty content
+            if (orderedContent.isEmpty() && !prevFiltered.isEmpty()) {
+                orderedContent = new ArrayList<>(prevFiltered);
+            }
             List<String> currFiltered = filterContent(pr.revisions.get(i), pr.metadata, title);
             orderedContent = processTransition(orderedContent, prevFiltered, currFiltered);
             prevFiltered = currFiltered;
@@ -372,5 +426,60 @@ class OneNoteRevisionDeduplicator {
         }
 
         return matchCount >= previous.size() * 0.5;
+    }
+
+    // ---- Single-revision page content extraction ----
+
+    private static List<String> extractSingleRevisionContent(
+            List<String> revision, Set<String> metadata, String title) {
+        List<String> result = new ArrayList<>();
+        result.add(title);
+
+        int dateIdx = -1;
+        int timeIdx = -1;
+        for (int i = 0; i < revision.size(); i++) {
+            if (dateIdx == -1 && isDatePattern(revision.get(i))) dateIdx = i;
+            if (isTimePattern(revision.get(i))) timeIdx = i;
+        }
+
+        // Content between date and time (excluding metadata and title)
+        if (dateIdx >= 0 && timeIdx > dateIdx) {
+            for (int i = dateIdx + 1; i < timeIdx; i++) {
+                String item = revision.get(i);
+                if (!metadata.contains(item) && !item.equals(title)) {
+                    result.add(item);
+                }
+            }
+        }
+
+        // Content before date (added last in OneNote → bottom of page)
+        if (dateIdx > 0) {
+            for (int i = 0; i < dateIdx; i++) {
+                String item = revision.get(i);
+                if (!metadata.contains(item) && !item.equals(title)) {
+                    result.add(item);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // ---- Date/Time pattern detection ----
+
+    private static final Pattern DATE_PATTERN = Pattern.compile(
+        "^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), " +
+        "(January|February|March|April|May|June|July|August|September|October|November|December) " +
+        "\\d{1,2}, \\d{4}$");
+
+    private static final Pattern TIME_PATTERN = Pattern.compile(
+        "^\\d{1,2}:\\d{2} (AM|PM)$");
+
+    private static boolean isDatePattern(String s) {
+        return DATE_PATTERN.matcher(s).matches();
+    }
+
+    private static boolean isTimePattern(String s) {
+        return TIME_PATTERN.matcher(s).matches();
     }
 }
